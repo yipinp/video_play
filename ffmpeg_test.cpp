@@ -32,7 +32,8 @@ int main(int argc, char* argv[])
 	av_register_all();
 	avdevice_register_all();
 	avformat_network_init();
-	AVFormatContext *ifmt_ctx = avformat_alloc_context();
+	AVFormatContext *ifmt_ctx = NULL;
+	AVFormatContext *ifmt_ctx_a = NULL;
 	AVFormatContext *ofmt_ctx = NULL;
 	AVDeviceInfoList *device_info = NULL;
 	AVDictionary *options = NULL;
@@ -56,7 +57,7 @@ int main(int argc, char* argv[])
 		return 1;
 	}
 
-	if (avformat_open_input(&ifmt_ctx, "audio=Headset Microphone (USB Audio D", iformat, NULL) != 0){
+	if (avformat_open_input(&ifmt_ctx_a, "audio=Headset Microphone (USB Audio D", iformat, NULL) != 0){
 		printf("Fail to open audio device\n");
 		return 1;
 
@@ -68,18 +69,25 @@ int main(int argc, char* argv[])
 		return 1;
 	}
 
+	if (avformat_find_stream_info(ifmt_ctx_a, NULL) < 0){
+		printf("Could not find the video stream information\n");
+		return 1;
+	}
+
 	int videoindex = -1;
 	int audioindex = -1;
 	for (int i = 0; i < ifmt_ctx->nb_streams; i++){
 		if (ifmt_ctx->streams[i]->codec->codec_type == AVMEDIA_TYPE_VIDEO){
 			videoindex = i;
+			break;
 		}
 
 	}
 
-	for (int i = 0; i < ifmt_ctx->nb_streams; i++){
-		if (ifmt_ctx->streams[i]->codec->codec_type == AVMEDIA_TYPE_AUDIO){
+	for (int i = 0; i < ifmt_ctx_a->nb_streams; i++){
+		if (ifmt_ctx_a->streams[i]->codec->codec_type == AVMEDIA_TYPE_AUDIO){
 			audioindex = i;
+			break;
 		}
 
 	}
@@ -95,7 +103,7 @@ int main(int argc, char* argv[])
 
 	}
 
-	if (avcodec_open2(ifmt_ctx->streams[audioindex]->codec, avcodec_find_decoder(ifmt_ctx->streams[audioindex]->codec->codec_id), NULL) < 0){
+	if (avcodec_open2(ifmt_ctx_a->streams[audioindex]->codec, avcodec_find_decoder(ifmt_ctx_a->streams[audioindex]->codec->codec_id), NULL) < 0){
 		printf("Fail to open the audio codec\n");
 		return 1;
 
@@ -158,8 +166,8 @@ int main(int argc, char* argv[])
 	pEncACodecCtx->channels = 2;
 	pEncACodecCtx->bit_rate = 32000; //32kb
 	pEncACodecCtx->time_base.num = 1;
-	pEncACodecCtx->time_base.den = ifmt_ctx->streams[audioindex]->codec->sample_rate;
-	pEncACodecCtx->sample_rate = ifmt_ctx->streams[audioindex]->codec->sample_rate;
+	pEncACodecCtx->time_base.den = ifmt_ctx_a->streams[audioindex]->codec->sample_rate;
+	pEncACodecCtx->sample_rate = ifmt_ctx_a->streams[audioindex]->codec->sample_rate;
 	pEncACodecCtx->sample_fmt = pAEnc->sample_fmts[0];
 	if (avcodec_open2(pEncACodecCtx, pAEnc, NULL) < 0){
 		printf("Fail to open the audio encoder\n");
@@ -173,7 +181,7 @@ int main(int argc, char* argv[])
 		return 1;
 	}
 	audio_st->time_base.num = 1;
-	audio_st->time_base.den = ifmt_ctx->streams[audioindex]->codec->sample_rate;
+	audio_st->time_base.den = ifmt_ctx_a->streams[audioindex]->codec->sample_rate;
 	audio_st->codec = pEncACodecCtx;
 
 	//open output
@@ -222,6 +230,10 @@ int main(int argc, char* argv[])
 	int dec_got_frame_a, enc_got_frame_a;
 	struct SwsContext *img_convert_ctx;
 	struct SwrContext *aud_convert_ctx;
+	int framecnt = 0;
+	AVPacket enc_pkt;
+	img_convert_ctx = sws_getContext(pEncCodecCtx->width, pEncCodecCtx->height,
+		pEncCodecCtx->pix_fmt, pEncCodecCtx->width, pEncCodecCtx->height, AV_PIX_FMT_YUV420P, SWS_BICUBIC, NULL, NULL, NULL);
 	while (true){
 		//compare PTS and audio pts >= video_pts, write video
 		if (av_compare_ts(vid_next_pts, time_base_q, aud_next_pts, time_base_q) <= 0){
@@ -237,11 +249,35 @@ int main(int argc, char* argv[])
 					break;
 				}
 				if (dec_got_frame){
-					sws_scale(img_convert_ctx, (const uint8_t* const*)pframe->data, pframe->linesize, 0, ifmt_ctx->streams[videoindex]->codec->height, pFrameYUV->data, pFrameYUV->linesize);
+					sws_scale(img_convert_ctx, (const uint8_t* const*)pframe->data, pframe->linesize, 0, pEncCodecCtx->height, pFrameYUV->data, pFrameYUV->linesize);
 					pFrameYUV->width = pframe->width;
 					pFrameYUV->height = pframe->height;
 					pFrameYUV->format = AV_PIX_FMT_YUV420P;
+				}
+				//encoder
+				enc_pkt.data = NULL;
+				enc_pkt.size = 0;
+				av_init_packet(&enc_pkt);
+				ret = avcodec_encode_video2(pEncCodecCtx, &enc_pkt, pFrameYUV, &enc_got_frame);
+				av_frame_free(&pframe);
+				if (enc_got_frame == 1){
+					framecnt++;
+					enc_pkt.stream_index = video_st->index;
+					AVRational time_base = ofmt_ctx->streams[0]->time_base;
+					AVRational r_framerate = ifmt_ctx->streams[videoindex]->r_frame_rate;
+					int64_t calc_duration = (double)(AV_TIME_BASE)*(1 / av_q2d(r_framerate));
+					enc_pkt.pts = av_rescale_q(framecnt*calc_duration, time_base_q, time_base);
+					enc_pkt.dts = enc_pkt.pts;
+					enc_pkt.duration = av_rescale_q(calc_duration, time_base_q, time_base);
+					enc_pkt.pos = -1;
+					vid_next_pts = framecnt*calc_duration;
+					int64_t pts_time = av_rescale_q(enc_pkt.pts, time_base, time_base_q);
+					int64_t now_time = av_gettime() - start_time;
+					if ((pts_time > now_time) && ((vid_next_pts + pts_time - now_time)<aud_next_pts))
+						av_usleep(pts_time - now_time);
 
+					ret = av_interleaved_write_frame(ofmt_ctx, &enc_pkt);
+					av_free_packet(&enc_pkt);
 				}
 
 
